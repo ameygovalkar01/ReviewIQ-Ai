@@ -1,0 +1,6 @@
+# Merge these into your existing .gitignore (don't overwrite it)
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.DS_Store
