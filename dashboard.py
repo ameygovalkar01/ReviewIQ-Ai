@@ -754,3 +754,228 @@ with st.expander("Explore Classified Feedback", expanded=bool(search_query)):
         st.caption("No classified rows yet, or none match the current filters/search.")
     else:
         st.caption("Upload and classify a file to see raw rows here.")
+
+# ======================================================
+# NEW FEATURE: Downloadable Detailed Report (Word / PDF)
+# Everything below is additive -- nothing above this line
+# was changed. Requires 'python-docx' and 'reportlab' to
+# be present in requirements.txt.
+# ======================================================
+import io
+from datetime import datetime
+
+
+def build_report_sections() -> dict:
+    """Gather everything needed for the report from data already computed above."""
+    priority_rows = None
+    keywords = None
+    if is_custom_data and feedback_df is not None and "Urgency" in feedback_df.columns and "Sentiment" in feedback_df.columns:
+        priority_rows = feedback_df[
+            feedback_df["Urgency"].isin(["Critical", "High"]) & (feedback_df["Sentiment"] == "Negative")
+        ]
+        if text_col and not priority_rows.empty:
+            keywords = extract_top_keywords(priority_rows[text_col].tolist(), top_n=12)
+
+    return {
+        "generated_at": datetime.now().strftime("%B %d, %Y %I:%M %p"),
+        "total_count": total_count,
+        "pos_pct": pos_pct, "neu_pct": neu_pct, "neg_pct": neg_pct,
+        "pos_count": pos_count, "neu_count": neu_count, "neg_count": neg_count,
+        "avg_confidence": avg_confidence,
+        "sentiment_df": sentiment_df,
+        "topics_df": topics_df,
+        "urgency_df": urgency_df,
+        "is_custom_data": is_custom_data,
+        "text_col": text_col,
+        "priority_rows": priority_rows,
+        "keywords": keywords,
+    }
+
+
+def _fmt_cell(val):
+    return f"{val:,}" if isinstance(val, (int, float)) and not isinstance(val, bool) else str(val)
+
+
+def generate_docx_report(sections: dict) -> bytes:
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading("ReviewIQ AI \u2014 Detailed Analytics Report", level=0)
+    gen_p = doc.add_paragraph(f"Generated on {sections['generated_at']}")
+    gen_p.runs[0].italic = True
+
+    doc.add_heading("Executive Summary", level=1)
+    doc.add_paragraph(
+        f"This report covers {sections['total_count']:,} classified submissions. "
+        f"Sentiment breakdown: {sections['pos_pct']}% positive ({sections['pos_count']:,}), "
+        f"{sections['neu_pct']}% neutral ({sections['neu_count']:,}), "
+        f"{sections['neg_pct']}% negative ({sections['neg_count']:,})."
+    )
+    if sections["avg_confidence"] is not None:
+        doc.add_paragraph(f"Average model confidence across sentiment predictions: {sections['avg_confidence']}%.")
+    if not sections["is_custom_data"]:
+        doc.add_paragraph("Note: this report reflects sample demo data. Upload and classify a file for a live report.")
+
+    def add_df_table(heading, df, cols):
+        doc.add_heading(heading, level=1)
+        if df is None or df.empty:
+            doc.add_paragraph("No data available.")
+            return
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.style = "Light Grid Accent 1"
+        for i, c in enumerate(cols):
+            table.rows[0].cells[i].text = str(c)
+        for _, row in df.iterrows():
+            cells = table.add_row().cells
+            for i, c in enumerate(cols):
+                cells[i].text = _fmt_cell(row[c])
+
+    add_df_table("Sentiment Distribution", sections["sentiment_df"][["Sentiment", "Count"]], ["Sentiment", "Count"])
+    add_df_table("Topic Breakdown", sections["topics_df"], ["Topic", "Mentions"])
+    add_df_table("Urgency Breakdown", sections["urgency_df"], ["Urgency", "Count"])
+
+    doc.add_heading("Priority Action Items", level=1)
+    priority_rows = sections["priority_rows"]
+    if priority_rows is not None and not priority_rows.empty:
+        cols = [c for c in [sections["text_col"], "Topic", "Urgency", "Sentiment_Confidence"]
+                if c and c in priority_rows.columns]
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.style = "Light Grid Accent 1"
+        for i, c in enumerate(cols):
+            table.rows[0].cells[i].text = str(c)
+        for _, row in priority_rows.head(20).iterrows():
+            cells = table.add_row().cells
+            for i, c in enumerate(cols):
+                cells[i].text = _fmt_cell(row[c])
+    else:
+        doc.add_paragraph("No critical/high-urgency negative reviews found in the classified sample.")
+
+    if sections["keywords"]:
+        doc.add_heading("Top Keywords in Negative Feedback", level=1)
+        doc.add_paragraph(", ".join(f"{w} ({c})" for w, c in sections["keywords"]))
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def generate_pdf_report(sections: dict) -> bytes:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleX", parent=styles["Title"], textColor=colors.HexColor("#0f172a"))
+    h_style = ParagraphStyle("HeadingX", parent=styles["Heading2"],
+                              textColor=colors.HexColor("#4f46e5"), spaceBefore=14, spaceAfter=6)
+    body_style = styles["BodyText"]
+
+    story = [
+        Paragraph("ReviewIQ AI \u2014 Detailed Analytics Report", title_style),
+        Paragraph(f"Generated on {sections['generated_at']}", body_style),
+        Spacer(1, 14),
+        Paragraph("Executive Summary", h_style),
+        Paragraph(
+            f"This report covers {sections['total_count']:,} classified submissions. "
+            f"Sentiment breakdown: {sections['pos_pct']}% positive ({sections['pos_count']:,}), "
+            f"{sections['neu_pct']}% neutral ({sections['neu_count']:,}), "
+            f"{sections['neg_pct']}% negative ({sections['neg_count']:,}).", body_style),
+    ]
+    if sections["avg_confidence"] is not None:
+        story.append(Paragraph(f"Average model confidence across sentiment predictions: {sections['avg_confidence']}%.", body_style))
+    if not sections["is_custom_data"]:
+        story.append(Paragraph("Note: this report reflects sample demo data.", body_style))
+
+    def df_table(df, cols):
+        data = [cols] + [[_fmt_cell(row[c]) for c in cols] for _, row in df.iterrows()]
+        t = Table(data, hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ]))
+        return t
+
+    story.append(Paragraph("Sentiment Distribution", h_style))
+    story.append(df_table(sections["sentiment_df"][["Sentiment", "Count"]], ["Sentiment", "Count"]))
+
+    if not sections["topics_df"].empty:
+        story.append(Paragraph("Topic Breakdown", h_style))
+        story.append(df_table(sections["topics_df"], ["Topic", "Mentions"]))
+
+    if not sections["urgency_df"].empty:
+        story.append(Paragraph("Urgency Breakdown", h_style))
+        story.append(df_table(sections["urgency_df"], ["Urgency", "Count"]))
+
+    story.append(Paragraph("Priority Action Items", h_style))
+    priority_rows = sections["priority_rows"]
+    if priority_rows is not None and not priority_rows.empty:
+        cols = [c for c in [sections["text_col"], "Topic", "Urgency", "Sentiment_Confidence"]
+                if c and c in priority_rows.columns]
+        rows_data = priority_rows.head(20)[cols].copy()
+        for c in cols:
+            rows_data[c] = rows_data[c].astype(str).str.slice(0, 60)
+        story.append(df_table(rows_data, cols))
+    else:
+        story.append(Paragraph("No critical/high-urgency negative reviews found in the classified sample.", body_style))
+
+    if sections["keywords"]:
+        story.append(Paragraph("Top Keywords in Negative Feedback", h_style))
+        story.append(Paragraph(", ".join(f"{w} ({c})" for w, c in sections["keywords"]), body_style))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+st.markdown("<hr style='margin: 24px 0; border-color: #e2e8f0;'>", unsafe_allow_html=True)
+st.markdown("""<div class="panel-box"><div class="panel-title">\U0001F4C4 Detailed Report</div>
+    <div class="panel-subtitle">Export the full analytics summary as a Word or PDF document</div>""", unsafe_allow_html=True)
+
+_report_sections = build_report_sections()
+report_btn_col1, report_btn_col2 = st.columns(2)
+
+try:
+    _docx_bytes = generate_docx_report(_report_sections)
+    _docx_available = True
+except ModuleNotFoundError:
+    _docx_bytes, _docx_available = None, False
+
+try:
+    _pdf_bytes = generate_pdf_report(_report_sections)
+    _pdf_available = True
+except ModuleNotFoundError:
+    _pdf_bytes, _pdf_available = None, False
+
+with report_btn_col1:
+    if _docx_available:
+        st.download_button(
+            "\u2b07\ufe0f Download Report (Word)",
+            data=_docx_bytes,
+            file_name="reviewiq_detailed_report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+    else:
+        st.caption("Word export needs the 'python-docx' package. Add it to requirements.txt and redeploy.")
+
+with report_btn_col2:
+    if _pdf_available:
+        st.download_button(
+            "\u2b07\ufe0f Download Report (PDF)",
+            data=_pdf_bytes,
+            file_name="reviewiq_detailed_report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    else:
+        st.caption("PDF export needs the 'reportlab' package. Add it to requirements.txt and redeploy.")
+
+st.markdown("</div>", unsafe_allow_html=True)
