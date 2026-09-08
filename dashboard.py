@@ -1,3 +1,6 @@
+import re
+from collections import Counter
+
 import streamlit as st
 import pandas as pd
 import altair as alt
@@ -66,6 +69,7 @@ st.markdown("""
     .badge-green { background-color: #dcfce7; color: #15803d; }
     .badge-amber { background-color: #fef3c7; color: #b45309; }
     .badge-red { background-color: #ffe4e6; color: #be123c; }
+    .badge-purple { background-color: #f3e8ff; color: #7e22ce; }
 
     .panel-box {
         background: #ffffff;
@@ -87,6 +91,18 @@ st.markdown("""
         margin-bottom: 16px;
     }
 
+    .keyword-chip {
+        display: inline-block;
+        background: #fef2f2;
+        color: #b91c1c;
+        border: 1px solid #fecaca;
+        border-radius: 9999px;
+        padding: 4px 12px;
+        margin: 3px;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+
     div[data-testid="stExpander"] {
         border: 1px solid #e2e8f0 !important;
         border-radius: 10px !important;
@@ -99,6 +115,15 @@ TOPIC_LABELS = ["Billing", "Customer Support", "Web App", "Mobile App", "Product
 URGENCY_LABELS = ["Critical", "High", "Medium", "Low"]
 SENTIMENT_LABEL_MAP = {"negative": "Negative", "neutral": "Neutral", "positive": "Positive"}
 CHUNK_SIZE = 16  # batch size for progress updates
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "been",
+    "to", "of", "in", "on", "for", "with", "this", "that", "it", "its", "i", "we",
+    "you", "your", "my", "our", "they", "their", "at", "as", "by", "from", "not",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
+    "so", "very", "just", "than", "then", "there", "here", "if", "when", "what",
+    "which", "who", "how", "all", "any", "some", "no", "yes", "app", "product"
+}
 
 
 # ----------------------------------------------------
@@ -181,6 +206,17 @@ def guess_text_column(df: pd.DataFrame) -> str:
     return object_cols[0] if object_cols else df.columns[0]
 
 
+def extract_top_keywords(texts, top_n=12):
+    """Simple frequency-based keyword extraction, no extra ML deps."""
+    counter = Counter()
+    for t in texts:
+        words = re.findall(r"[a-zA-Z']{3,}", str(t).lower())
+        for w in words:
+            if w not in STOPWORDS:
+                counter[w] += 1
+    return counter.most_common(top_n)
+
+
 @st.cache_data(show_spinner="Parsing uploaded file...")
 def load_feedback_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     name = filename.lower()
@@ -216,6 +252,11 @@ def get_mock_data():
     return total_count, sentiment_df, topics_df, urgency_df
 
 
+@st.cache_data(show_spinner=False)
+def convert_df_to_csv(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # ----------------------------------------------------
 # Sidebar: Data Controls
 # ----------------------------------------------------
@@ -241,6 +282,7 @@ with st.sidebar:
     run_sentiment_ai = run_topic_ai = run_urgency_ai = False
     max_rows = 200
     run_clicked = False
+    reset_clicked = False
 
     if uploaded_file is not None:
         try:
@@ -268,7 +310,11 @@ with st.sidebar:
                 help="Zero-shot classification is slow on CPU. Lower this for a quick preview; raise it for full coverage."
             )
 
-            run_clicked = st.button("🚀 Run AI Classification", use_container_width=True)
+            btn_col1, btn_col2 = st.columns([3, 1])
+            with btn_col1:
+                run_clicked = st.button("🚀 Run AI Classification", use_container_width=True)
+            with btn_col2:
+                reset_clicked = st.button("↺", help="Clear classified results and re-run from scratch", use_container_width=True)
         except Exception as e:
             st.sidebar.error(f"Error reading file: {e}")
 
@@ -293,6 +339,14 @@ with st.sidebar:
         default=["Positive", "Neutral", "Negative"]
     )
 
+    min_confidence = st.slider(
+        "Min. Confidence",
+        min_value=0.0, max_value=1.0, value=0.0, step=0.05,
+        help="Hide rows below this sentiment-model confidence score."
+    )
+
+    search_query = st.text_input("🔍 Search feedback text", placeholder="e.g. refund, crash, slow...")
+
 # ----------------------------------------------------
 # Run classification / manage session state
 # ----------------------------------------------------
@@ -303,12 +357,17 @@ if is_custom_data:
     raw_df = load_feedback_file(uploaded_file.getvalue(), uploaded_file.name)
     state_key = f"classified::{uploaded_file.name}::{uploaded_file.size}"
 
+    if reset_clicked and state_key in st.session_state:
+        del st.session_state[state_key]
+        st.sidebar.info("Cleared previous results. Click Run AI Classification again.")
+
     if run_clicked:
         sample_df = raw_df.head(max_rows).copy()
 
         try:
-            sentiment_pipe = load_sentiment_model() if run_sentiment_ai else None
-            zero_shot_pipe = load_zero_shot_model() if (run_topic_ai or run_urgency_ai) else None
+            with st.spinner("Loading models (first run can take a minute)..."):
+                sentiment_pipe = load_sentiment_model() if run_sentiment_ai else None
+                zero_shot_pipe = load_zero_shot_model() if (run_topic_ai or run_urgency_ai) else None
 
             texts = tuple(sample_df[text_col].astype(str).fillna("").tolist())
             sentiments, scores, topics, urgencies = classify_texts(
@@ -347,12 +406,18 @@ if not is_custom_data:
     if sentiment_filter and set(sentiment_filter) != {"Positive", "Neutral", "Negative"}:
         sentiment_df = sentiment_df[sentiment_df["Sentiment"].isin(sentiment_filter)]
         total_count = int(sentiment_df["Count"].sum())
+    avg_confidence = None
+    topic_sentiment_df = pd.DataFrame()
 else:
     filtered = feedback_df.copy()
     if "Sentiment" in filtered.columns and sentiment_filter:
         filtered = filtered[filtered["Sentiment"].isin(sentiment_filter)]
     if "Topic" in filtered.columns and department:
         filtered = filtered[filtered["Topic"].isin(department)]
+    if "Sentiment_Confidence" in filtered.columns and min_confidence > 0:
+        filtered = filtered[filtered["Sentiment_Confidence"] >= min_confidence]
+    if search_query and text_col and text_col in filtered.columns:
+        filtered = filtered[filtered[text_col].astype(str).str.contains(search_query, case=False, na=False)]
 
     total_count = len(filtered)
 
@@ -380,6 +445,19 @@ else:
     else:
         urgency_df = pd.DataFrame({"Urgency": [], "Count": []})
 
+    avg_confidence = (
+        round(float(filtered["Sentiment_Confidence"].mean()) * 100, 1)
+        if "Sentiment_Confidence" in filtered.columns and not filtered.empty
+        else None
+    )
+
+    if "Topic" in filtered.columns and "Sentiment" in filtered.columns:
+        topic_sentiment_df = (
+            filtered.groupby(["Topic", "Sentiment"]).size().reset_index(name="Count")
+        )
+    else:
+        topic_sentiment_df = pd.DataFrame()
+
     feedback_df = filtered
 
 pos_count = int(sentiment_df.loc[sentiment_df["Sentiment"] == "Positive", "Count"].sum())
@@ -391,43 +469,61 @@ sentiment_df["Color"] = sentiment_df["Sentiment"].map({"Positive": "#10b981", "N
 # ----------------------------------------------------
 # Main Header
 # ----------------------------------------------------
-st.markdown(
-    """
-    <div style='margin-bottom: 24px;'>
-        <h1 style='color: #0f172a; font-size: 2.1rem; font-weight: 700; margin-bottom: 4px; letter-spacing: -0.02em;'>
-            ReviewIQ <span style='background: linear-gradient(135deg, #4f46e5, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>AI</span>
-        </h1>
-        <p style='color: #64748b; font-size: 0.95rem; margin: 0;'>Continuous intelligence & customer sentiment synthesis</p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+header_col1, header_col2 = st.columns([4, 1])
+with header_col1:
+    st.markdown(
+        """
+        <div style='margin-bottom: 24px;'>
+            <h1 style='color: #0f172a; font-size: 2.1rem; font-weight: 700; margin-bottom: 4px; letter-spacing: -0.02em;'>
+                ReviewIQ <span style='background: linear-gradient(135deg, #4f46e5, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>AI</span>
+            </h1>
+            <p style='color: #64748b; font-size: 0.95rem; margin: 0;'>Continuous intelligence & customer sentiment synthesis</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+with header_col2:
+    if is_custom_data and "Sentiment" in feedback_df.columns:
+        st.download_button(
+            "⬇️ Export CSV",
+            data=convert_df_to_csv(feedback_df),
+            file_name="classified_feedback.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 if not is_custom_data:
     st.info("Showing sample demo data. Upload a file and click **Run AI Classification** in the sidebar to analyze your own reviews.", icon="ℹ️")
 elif "Sentiment" not in feedback_df.columns and "Topic" not in feedback_df.columns:
     st.warning("File loaded but not yet classified. Pick a text column and click **Run AI Classification** in the sidebar.", icon="⚠️")
+elif search_query:
+    st.caption(f"Showing results filtered by search: \"{search_query}\" — {total_count:,} matching rows.")
 
 # ----------------------------------------------------
 # KPI Cards
 # ----------------------------------------------------
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-with kpi1:
+kpi_cols = st.columns(5) if avg_confidence is not None else st.columns(4)
+with kpi_cols[0]:
     st.markdown(f"""<div class="metric-card"><div class="metric-label">Total Submissions</div>
         <div class="metric-value">{total_count:,}</div><span class="metric-badge badge-blue">100% Ingested</span></div>""",
         unsafe_allow_html=True)
-with kpi2:
+with kpi_cols[1]:
     st.markdown(f"""<div class="metric-card"><div class="metric-label">Positive Sentiment</div>
         <div class="metric-value" style="color: #059669;">{pos_pct}%</div><span class="metric-badge badge-green">{pos_count:,} responses</span></div>""",
         unsafe_allow_html=True)
-with kpi3:
+with kpi_cols[2]:
     st.markdown(f"""<div class="metric-card"><div class="metric-label">Neutral Sentiment</div>
         <div class="metric-value" style="color: #64748b;">{neu_pct}%</div><span class="metric-badge badge-amber">{neu_count:,} responses</span></div>""",
         unsafe_allow_html=True)
-with kpi4:
+with kpi_cols[3]:
     st.markdown(f"""<div class="metric-card"><div class="metric-label">Negative Sentiment</div>
         <div class="metric-value" style="color: #e11d48;">{neg_pct}%</div><span class="metric-badge badge-red">{neg_count:,} responses</span></div>""",
         unsafe_allow_html=True)
+if avg_confidence is not None:
+    with kpi_cols[4]:
+        st.markdown(f"""<div class="metric-card"><div class="metric-label">Avg. Model Confidence</div>
+            <div class="metric-value" style="color: #7e22ce;">{avg_confidence}%</div><span class="metric-badge badge-purple">RoBERTa score</span></div>""",
+            unsafe_allow_html=True)
 
 st.write("")
 
@@ -480,6 +576,42 @@ with chart_right:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ----------------------------------------------------
+# NEW: Topic x Sentiment cross-analysis + Confidence distribution
+# ----------------------------------------------------
+cross_left, cross_right = st.columns([1, 1])
+
+with cross_left:
+    st.markdown("""<div class="panel-box"><div class="panel-title">Sentiment by Topic</div>
+        <div class="panel-subtitle">Where negative sentiment concentrates across categories</div>""", unsafe_allow_html=True)
+    if is_custom_data and not topic_sentiment_df.empty:
+        stacked_chart = alt.Chart(topic_sentiment_df).mark_bar().encode(
+            x=alt.X("Count:Q", title="Reviews", stack="normalize", axis=alt.Axis(format="%")),
+            y=alt.Y("Topic:N", title="", sort="-x"),
+            color=alt.Color("Sentiment:N", scale=alt.Scale(
+                domain=["Positive", "Neutral", "Negative"], range=["#10b981", "#94a3b8", "#f43f5e"]),
+                legend=alt.Legend(orient="bottom", title="")),
+            tooltip=[alt.Tooltip("Topic"), alt.Tooltip("Sentiment"), alt.Tooltip("Count", format=",")]
+        ).properties(height=240)
+        st.altair_chart(stacked_chart, use_container_width=True)
+    else:
+        st.caption("Run AI Classification with both Topic and Sentiment enabled to populate this chart.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with cross_right:
+    st.markdown("""<div class="panel-box"><div class="panel-title">Model Confidence Distribution</div>
+        <div class="panel-subtitle">How confident the sentiment model was, per prediction</div>""", unsafe_allow_html=True)
+    if is_custom_data and "Sentiment_Confidence" in feedback_df.columns and not feedback_df.empty:
+        conf_chart = alt.Chart(feedback_df).mark_bar(color="#7e22ce", cornerRadiusEnd=4).encode(
+            x=alt.X("Sentiment_Confidence:Q", bin=alt.Bin(maxbins=20), title="Confidence Score"),
+            y=alt.Y("count():Q", title="Reviews"),
+            tooltip=[alt.Tooltip("count():Q", title="Reviews")]
+        ).properties(height=240)
+        st.altair_chart(conf_chart, use_container_width=True)
+    else:
+        st.caption("Run AI Classification with Sentiment prediction enabled to populate this chart.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ----------------------------------------------------
 # Priority Action Items (real, ML-derived) + Summary
 # ----------------------------------------------------
 row2_col1, row2_col2 = st.columns([1, 1])
@@ -497,6 +629,14 @@ with row2_col1:
         else:
             show_cols = [c for c in [text_col, "Topic", "Urgency", "Sentiment_Confidence"] if c and c in priority.columns]
             st.dataframe(priority[show_cols].head(10), use_container_width=True, hide_index=True)
+
+        # NEW: top keywords driving negative feedback
+        if text_col and not priority.empty:
+            keywords = extract_top_keywords(priority[text_col].tolist(), top_n=12)
+            if keywords:
+                st.markdown("<div style='margin-top:12px; font-size:0.8rem; color:#64748b; font-weight:600;'>TOP KEYWORDS IN NEGATIVE FEEDBACK</div>", unsafe_allow_html=True)
+                chips = "".join(f"<span class='keyword-chip'>{word} ({count})</span>" for word, count in keywords)
+                st.markdown(f"<div style='margin-top:6px;'>{chips}</div>", unsafe_allow_html=True)
     elif not is_custom_data:
         issues_df = pd.DataFrame([
             {"Issue": "Gateway timeout during checkout", "Severity": "P1 - Critical", "Tickets": 820, "Status": "Open"},
@@ -515,11 +655,26 @@ with row2_col2:
             f"<p><strong>• Top Category:</strong> \"{topics_df.iloc[0]['Topic']}\" has the most mentions ({int(topics_df.iloc[0]['Mentions']):,}).</p>"
             if not topics_df.empty else ""
         )
+        confidence_line = (
+            f"<p><strong>• Model Confidence:</strong> Average confidence across predictions is {avg_confidence}%.</p>"
+            if avg_confidence is not None else ""
+        )
+        critical_count = 0
+        if "Urgency" in feedback_df.columns and "Sentiment" in feedback_df.columns:
+            critical_count = int(
+                ((feedback_df["Urgency"] == "Critical") & (feedback_df["Sentiment"] == "Negative")).sum()
+            )
+        critical_line = (
+            f"<p><strong>• Immediate Attention:</strong> {critical_count} review(s) flagged Critical + Negative.</p>"
+            if "Urgency" in feedback_df.columns else ""
+        )
         html = f"""<div class="panel-box"><div class="panel-title">Data Summary</div>
             <div class="panel-subtitle">Computed directly from AI-classified data</div>
             <div style="font-size: 0.885rem; color: #334155; line-height: 1.6;">
                 <p><strong>• Sentiment Split:</strong> {pos_pct}% positive, {neu_pct}% neutral, {neg_pct}% negative across {total_count:,} rows.</p>
                 {top_topic_line}
+                {confidence_line}
+                {critical_line}
             </div></div>"""
     else:
         html = f"""<div class="panel-box"><div class="panel-title">Executive Synthesis</div>
@@ -533,8 +688,21 @@ with row2_col2:
 # ----------------------------------------------------
 # Explorer
 # ----------------------------------------------------
-with st.expander("Explore Classified Feedback"):
-    if is_custom_data and feedback_df is not None:
-        st.dataframe(feedback_df, use_container_width=True, hide_index=True)
+with st.expander("Explore Classified Feedback", expanded=bool(search_query)):
+    if is_custom_data and feedback_df is not None and not feedback_df.empty:
+        sort_options = [c for c in feedback_df.columns if c in
+                         (["Sentiment_Confidence", "Sentiment", "Topic", "Urgency"] + [text_col])]
+        if sort_options:
+            sort_col1, sort_col2 = st.columns([2, 1])
+            with sort_col1:
+                sort_by = st.selectbox("Sort by", options=sort_options, index=0, key="explorer_sort")
+            with sort_col2:
+                sort_dir = st.radio("Order", ["Desc", "Asc"], horizontal=True, key="explorer_sort_dir")
+            display_df = feedback_df.sort_values(by=sort_by, ascending=(sort_dir == "Asc"))
+        else:
+            display_df = feedback_df
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    elif is_custom_data and feedback_df is not None and feedback_df.empty:
+        st.caption("No rows match the current filters/search. Try widening your filters.")
     else:
         st.caption("Upload and classify a file to see raw rows here.")

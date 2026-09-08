@@ -4,5 +4,6 @@ altair>=5.0
 vaderSentiment>=3.3.2
 scikit-learn>=1.4
 openpyxl>=3.1
-transformers
+transformers>=4.30
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
