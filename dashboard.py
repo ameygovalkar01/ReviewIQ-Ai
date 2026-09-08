@@ -103,6 +103,16 @@ st.markdown("""
         font-weight: 600;
     }
 
+    .progress-note {
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        border-radius: 8px;
+        padding: 10px 14px;
+        font-size: 0.82rem;
+        color: #1e3a8a;
+        margin-bottom: 10px;
+    }
+
     div[data-testid="stExpander"] {
         border: 1px solid #e2e8f0 !important;
         border-radius: 10px !important;
@@ -114,7 +124,14 @@ st.markdown("""
 TOPIC_LABELS = ["Billing", "Customer Support", "Web App", "Mobile App", "Product Quality"]
 URGENCY_LABELS = ["Critical", "High", "Medium", "Low"]
 SENTIMENT_LABEL_MAP = {"negative": "Negative", "neutral": "Neutral", "positive": "Positive"}
-CHUNK_SIZE = 16  # batch size for progress updates
+
+# How many rows get classified per button click. Kept small on purpose so a
+# single run stays within free-tier CPU/RAM/time limits. Click the button
+# again to process the next batch -- progress is kept between clicks.
+ROWS_PER_BATCH = 20
+# How many texts we hand to the zero-shot pipeline in a single call. Batched
+# inference is far more efficient than one call per row per label-set.
+ZS_BATCH_SIZE = 8
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be", "been",
@@ -143,53 +160,53 @@ def load_sentiment_model():
 @st.cache_resource(show_spinner="Downloading/loading zero-shot model...")
 def load_zero_shot_model():
     from transformers import pipeline
-    # Lighter distilled model (~250MB vs ~1.6GB for bart-large-mnli)
-    # so it fits in Streamlit Community Cloud's free-tier RAM budget.
+    # Lighter distilled model (~250MB vs ~1.6GB for bart-large-mnli) so it
+    # fits free-tier RAM. Loaded once and reused across every batch/run.
     return pipeline("zero-shot-classification", model="valhalla/distilbart-mnli-12-3")
 
 
 # ----------------------------------------------------
-# Classification pipeline
+# Classification: batched zero-shot calls instead of one call per row.
+# The HF zero-shot pipeline accepts a LIST of texts and processes them as
+# one batch internally, which is dramatically faster than looping row by
+# row on CPU (fewer Python-level calls, better use of each forward pass).
 # ----------------------------------------------------
-# Leading-underscore args (_sentiment_pipe, _zero_shot_pipe) are NOT
-# hashed by st.cache_data -- only `texts`, `run_*` flags are, so this
-# only recomputes when the actual input text / options change.
-@st.cache_data(show_spinner=False)
-def classify_texts(texts: tuple, run_sentiment: bool, run_topic: bool, run_urgency: bool,
-                    _sentiment_pipe, _zero_shot_pipe):
+def classify_batch(texts: list, run_sentiment: bool, run_topic: bool, run_urgency: bool,
+                    sentiment_pipe, zero_shot_pipe, progress_cb=None):
     n = len(texts)
     sentiments, sentiment_scores = [None] * n, [None] * n
     topics = [None] * n
     urgencies = [None] * n
 
-    progress = st.progress(0.0, text="Running AI classification...")
-    total_steps = n
-    done = 0
+    if run_sentiment and sentiment_pipe is not None:
+        results = sentiment_pipe(texts, batch_size=16, truncation=True)
+        for i, r in enumerate(results):
+            label = SENTIMENT_LABEL_MAP.get(r["label"].lower(), r["label"])
+            sentiments[i] = label
+            sentiment_scores[i] = round(float(r["score"]), 3)
+    if progress_cb:
+        progress_cb(0.4 if (run_topic or run_urgency) else 1.0)
 
-    for start in range(0, n, CHUNK_SIZE):
-        chunk = list(texts[start:start + CHUNK_SIZE])
-
-        if run_sentiment:
-            results = _sentiment_pipe(chunk, batch_size=CHUNK_SIZE, truncation=True)
-            for i, r in enumerate(results):
-                label = SENTIMENT_LABEL_MAP.get(r["label"].lower(), r["label"])
-                sentiments[start + i] = label
-                sentiment_scores[start + i] = round(float(r["score"]), 3)
-
-        if run_topic:
-            for i, text in enumerate(chunk):
-                out = _zero_shot_pipe(text, TOPIC_LABELS, multi_label=False)
+    if run_topic and zero_shot_pipe is not None:
+        for start in range(0, n, ZS_BATCH_SIZE):
+            sub = texts[start:start + ZS_BATCH_SIZE]
+            outs = zero_shot_pipe(sub, TOPIC_LABELS, multi_label=False)
+            outs = outs if isinstance(outs, list) else [outs]
+            for i, out in enumerate(outs):
                 topics[start + i] = out["labels"][0]
+    if progress_cb:
+        progress_cb(0.7 if run_urgency else 1.0)
 
-        if run_urgency:
-            for i, text in enumerate(chunk):
-                out = _zero_shot_pipe(text, URGENCY_LABELS, multi_label=False)
+    if run_urgency and zero_shot_pipe is not None:
+        for start in range(0, n, ZS_BATCH_SIZE):
+            sub = texts[start:start + ZS_BATCH_SIZE]
+            outs = zero_shot_pipe(sub, URGENCY_LABELS, multi_label=False)
+            outs = outs if isinstance(outs, list) else [outs]
+            for i, out in enumerate(outs):
                 urgencies[start + i] = out["labels"][0]
+    if progress_cb:
+        progress_cb(1.0)
 
-        done += len(chunk)
-        progress.progress(min(done / total_steps, 1.0), text=f"Classified {done}/{total_steps} rows...")
-
-    progress.empty()
     return sentiments, sentiment_scores, topics, urgencies
 
 
@@ -280,7 +297,6 @@ with st.sidebar:
 
     text_col = None
     run_sentiment_ai = run_topic_ai = run_urgency_ai = False
-    max_rows = 200
     run_clicked = False
     reset_clicked = False
 
@@ -303,18 +319,33 @@ with st.sidebar:
             run_topic_ai = st.checkbox("Predict Topic/Category (zero-shot)", value=True)
             run_urgency_ai = st.checkbox("Predict Urgency (zero-shot)", value=True)
 
-            max_rows = st.slider(
-                "Max rows to classify (speed control)",
-                min_value=20, max_value=min(2000, max(20, len(_preview_df))),
-                value=min(200, len(_preview_df)), step=20,
-                help="Zero-shot classification is slow on CPU. Lower this for a quick preview; raise it for full coverage."
+            state_key = f"classified::{uploaded_file.name}::{uploaded_file.size}"
+            already_done = 0
+            if state_key in st.session_state:
+                already_done = st.session_state[state_key]["next_idx"]
+
+            total_rows = len(_preview_df)
+            remaining = total_rows - already_done
+
+            st.markdown(
+                f"<div class='progress-note'>Classified <b>{already_done:,} / {total_rows:,}</b> rows so far. "
+                f"Each click processes the next <b>{min(ROWS_PER_BATCH, max(remaining, 0)):,}</b> rows "
+                f"— click multiple times to cover the whole file without hitting free-tier limits.</div>",
+                unsafe_allow_html=True
             )
 
             btn_col1, btn_col2 = st.columns([3, 1])
             with btn_col1:
-                run_clicked = st.button("🚀 Run AI Classification", use_container_width=True)
+                label = "🚀 Classify Next Batch" if already_done > 0 else "🚀 Run AI Classification"
+                run_clicked = st.button(
+                    label, use_container_width=True,
+                    disabled=(remaining <= 0)
+                )
             with btn_col2:
-                reset_clicked = st.button("↺", help="Clear classified results and re-run from scratch", use_container_width=True)
+                reset_clicked = st.button("↺", help="Clear all classified results and start over", use_container_width=True)
+
+            if remaining <= 0 and total_rows > 0:
+                st.sidebar.success("✓ All rows classified.")
         except Exception as e:
             st.sidebar.error(f"Error reading file: {e}")
 
@@ -349,6 +380,7 @@ with st.sidebar:
 
 # ----------------------------------------------------
 # Run classification / manage session state
+# (resumable: one small batch per click, appended to what's already done)
 # ----------------------------------------------------
 is_custom_data = uploaded_file is not None
 feedback_df = None
@@ -359,44 +391,61 @@ if is_custom_data:
 
     if reset_clicked and state_key in st.session_state:
         del st.session_state[state_key]
-        st.sidebar.info("Cleared previous results. Click Run AI Classification again.")
+        st.sidebar.info("Cleared previous results.")
+
+    if state_key not in st.session_state:
+        empty = raw_df.copy()
+        for col in ["Sentiment", "Sentiment_Confidence", "Topic", "Urgency"]:
+            empty[col] = pd.NA
+        st.session_state[state_key] = {"df": empty, "next_idx": 0}
+
+    store = st.session_state[state_key]
 
     if run_clicked:
-        sample_df = raw_df.head(max_rows).copy()
+        start = store["next_idx"]
+        end = min(start + ROWS_PER_BATCH, len(raw_df))
+        batch_df = raw_df.iloc[start:end]
 
         try:
             with st.spinner("Loading models (first run can take a minute)..."):
                 sentiment_pipe = load_sentiment_model() if run_sentiment_ai else None
                 zero_shot_pipe = load_zero_shot_model() if (run_topic_ai or run_urgency_ai) else None
 
-            texts = tuple(sample_df[text_col].astype(str).fillna("").tolist())
-            sentiments, scores, topics, urgencies = classify_texts(
+            progress = st.progress(0.0, text=f"Classifying rows {start+1}-{end}...")
+            texts = batch_df[text_col].astype(str).fillna("").tolist()
+            sentiments, scores, topics, urgencies = classify_batch(
                 texts, run_sentiment_ai, run_topic_ai, run_urgency_ai,
-                sentiment_pipe, zero_shot_pipe
+                sentiment_pipe, zero_shot_pipe,
+                progress_cb=lambda p: progress.progress(p, text=f"Classifying rows {start+1}-{end}...")
             )
+            progress.empty()
 
+            idx = batch_df.index
             if run_sentiment_ai:
-                sample_df["Sentiment"] = sentiments
-                sample_df["Sentiment_Confidence"] = scores
-            elif "Sentiment" not in sample_df.columns:
-                sample_df["Sentiment"] = "Neutral"
+                store["df"].loc[idx, "Sentiment"] = sentiments
+                store["df"].loc[idx, "Sentiment_Confidence"] = scores
+            elif store["df"].loc[idx, "Sentiment"].isna().all():
+                store["df"].loc[idx, "Sentiment"] = "Neutral"
 
             if run_topic_ai:
-                sample_df["Topic"] = topics
+                store["df"].loc[idx, "Topic"] = topics
             if run_urgency_ai:
-                sample_df["Urgency"] = urgencies
+                store["df"].loc[idx, "Urgency"] = urgencies
 
-            st.session_state[state_key] = sample_df
-            st.sidebar.success(f"✓ Classified {len(sample_df):,} rows")
+            store["next_idx"] = end
+            st.session_state[state_key] = store
+            st.sidebar.success(f"✓ Classified rows {start+1}-{end} ({end:,}/{len(raw_df):,} total)")
         except ModuleNotFoundError as e:
             st.sidebar.error(
                 f"Missing dependency: {e}. Add 'transformers' and 'torch' to requirements.txt "
                 "and redeploy the app."
             )
         except Exception as e:
-            st.sidebar.error(f"Classification failed: {e}")
+            st.sidebar.error(f"Classification failed: {type(e).__name__}: {e}")
 
-    feedback_df = st.session_state.get(state_key, raw_df)
+    feedback_df_full = st.session_state[state_key]["df"]
+    # Only rows that have actually been classified feed the analytics below.
+    feedback_df = feedback_df_full[feedback_df_full["Sentiment"].notna()].copy()
 
 # ----------------------------------------------------
 # Build display data (apply filters)
@@ -413,9 +462,9 @@ else:
     if "Sentiment" in filtered.columns and sentiment_filter:
         filtered = filtered[filtered["Sentiment"].isin(sentiment_filter)]
     if "Topic" in filtered.columns and department:
-        filtered = filtered[filtered["Topic"].isin(department)]
+        filtered = filtered[filtered["Topic"].isin(department) | filtered["Topic"].isna()]
     if "Sentiment_Confidence" in filtered.columns and min_confidence > 0:
-        filtered = filtered[filtered["Sentiment_Confidence"] >= min_confidence]
+        filtered = filtered[filtered["Sentiment_Confidence"].fillna(0) >= min_confidence]
     if search_query and text_col and text_col in filtered.columns:
         filtered = filtered[filtered[text_col].astype(str).str.contains(search_query, case=False, na=False)]
 
@@ -431,7 +480,7 @@ else:
         sentiment_df = pd.DataFrame({"Sentiment": ["Positive", "Neutral", "Negative"], "Count": [0, 0, 0]})
 
     if "Topic" in filtered.columns:
-        topics_df = filtered["Topic"].value_counts().reset_index()
+        topics_df = filtered["Topic"].dropna().value_counts().reset_index()
         topics_df.columns = ["Topic", "Mentions"]
     else:
         topics_df = pd.DataFrame({"Topic": [], "Mentions": []})
@@ -447,13 +496,13 @@ else:
 
     avg_confidence = (
         round(float(filtered["Sentiment_Confidence"].mean()) * 100, 1)
-        if "Sentiment_Confidence" in filtered.columns and not filtered.empty
+        if "Sentiment_Confidence" in filtered.columns and filtered["Sentiment_Confidence"].notna().any()
         else None
     )
 
     if "Topic" in filtered.columns and "Sentiment" in filtered.columns:
         topic_sentiment_df = (
-            filtered.groupby(["Topic", "Sentiment"]).size().reset_index(name="Count")
+            filtered.dropna(subset=["Topic"]).groupby(["Topic", "Sentiment"]).size().reset_index(name="Count")
         )
     else:
         topic_sentiment_df = pd.DataFrame()
@@ -483,7 +532,7 @@ with header_col1:
         unsafe_allow_html=True
     )
 with header_col2:
-    if is_custom_data and "Sentiment" in feedback_df.columns:
+    if is_custom_data and "Sentiment" in feedback_df.columns and not feedback_df.empty:
         st.download_button(
             "⬇️ Export CSV",
             data=convert_df_to_csv(feedback_df),
@@ -494,8 +543,8 @@ with header_col2:
 
 if not is_custom_data:
     st.info("Showing sample demo data. Upload a file and click **Run AI Classification** in the sidebar to analyze your own reviews.", icon="ℹ️")
-elif "Sentiment" not in feedback_df.columns and "Topic" not in feedback_df.columns:
-    st.warning("File loaded but not yet classified. Pick a text column and click **Run AI Classification** in the sidebar.", icon="⚠️")
+elif feedback_df.empty:
+    st.warning("File loaded but not yet classified. Pick a text column and click **Run AI Classification** in the sidebar. Large files are classified in small batches — click the button repeatedly to keep going.", icon="⚠️")
 elif search_query:
     st.caption(f"Showing results filtered by search: \"{search_query}\" — {total_count:,} matching rows.")
 
@@ -576,7 +625,7 @@ with chart_right:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ----------------------------------------------------
-# NEW: Topic x Sentiment cross-analysis + Confidence distribution
+# Topic x Sentiment cross-analysis + Confidence distribution
 # ----------------------------------------------------
 cross_left, cross_right = st.columns([1, 1])
 
@@ -600,8 +649,8 @@ with cross_left:
 with cross_right:
     st.markdown("""<div class="panel-box"><div class="panel-title">Model Confidence Distribution</div>
         <div class="panel-subtitle">How confident the sentiment model was, per prediction</div>""", unsafe_allow_html=True)
-    if is_custom_data and "Sentiment_Confidence" in feedback_df.columns and not feedback_df.empty:
-        conf_chart = alt.Chart(feedback_df).mark_bar(color="#7e22ce", cornerRadiusEnd=4).encode(
+    if is_custom_data and "Sentiment_Confidence" in feedback_df.columns and feedback_df["Sentiment_Confidence"].notna().any():
+        conf_chart = alt.Chart(feedback_df.dropna(subset=["Sentiment_Confidence"])).mark_bar(color="#7e22ce", cornerRadiusEnd=4).encode(
             x=alt.X("Sentiment_Confidence:Q", bin=alt.Bin(maxbins=20), title="Confidence Score"),
             y=alt.Y("count():Q", title="Reviews"),
             tooltip=[alt.Tooltip("count():Q", title="Reviews")]
@@ -625,12 +674,11 @@ with row2_col1:
             feedback_df["Urgency"].isin(["Critical", "High"]) & (feedback_df["Sentiment"] == "Negative")
         ]
         if priority.empty:
-            st.caption("No critical/high-urgency negative reviews found in the classified sample.")
+            st.caption("No critical/high-urgency negative reviews found in the classified sample so far.")
         else:
             show_cols = [c for c in [text_col, "Topic", "Urgency", "Sentiment_Confidence"] if c and c in priority.columns]
             st.dataframe(priority[show_cols].head(10), use_container_width=True, hide_index=True)
 
-        # NEW: top keywords driving negative feedback
         if text_col and not priority.empty:
             keywords = extract_top_keywords(priority[text_col].tolist(), top_n=12)
             if keywords:
@@ -650,7 +698,7 @@ with row2_col1:
     st.markdown("</div>", unsafe_allow_html=True)
 
 with row2_col2:
-    if is_custom_data and "Sentiment" in feedback_df.columns:
+    if is_custom_data and "Sentiment" in feedback_df.columns and not feedback_df.empty:
         top_topic_line = (
             f"<p><strong>• Top Category:</strong> \"{topics_df.iloc[0]['Topic']}\" has the most mentions ({int(topics_df.iloc[0]['Mentions']):,}).</p>"
             if not topics_df.empty else ""
@@ -671,7 +719,7 @@ with row2_col2:
         html = f"""<div class="panel-box"><div class="panel-title">Data Summary</div>
             <div class="panel-subtitle">Computed directly from AI-classified data</div>
             <div style="font-size: 0.885rem; color: #334155; line-height: 1.6;">
-                <p><strong>• Sentiment Split:</strong> {pos_pct}% positive, {neu_pct}% neutral, {neg_pct}% negative across {total_count:,} rows.</p>
+                <p><strong>• Sentiment Split:</strong> {pos_pct}% positive, {neu_pct}% neutral, {neg_pct}% negative across {total_count:,} classified rows.</p>
                 {top_topic_line}
                 {confidence_line}
                 {critical_line}
@@ -703,6 +751,6 @@ with st.expander("Explore Classified Feedback", expanded=bool(search_query)):
             display_df = feedback_df
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     elif is_custom_data and feedback_df is not None and feedback_df.empty:
-        st.caption("No rows match the current filters/search. Try widening your filters.")
+        st.caption("No classified rows yet, or none match the current filters/search.")
     else:
         st.caption("Upload and classify a file to see raw rows here.")
